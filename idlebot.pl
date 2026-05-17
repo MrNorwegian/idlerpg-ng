@@ -1,6 +1,8 @@
 #!/usr/bin/env perl
 # irpg bot v3.1.2 by jotun, jotun@idlerpg.net, et al. See http://idlerpg.net/
 #          v3.1.3 by Bahhumbug, jrd@gerdesas.com
+#          v3.1.4 by naka, drift@da9.no
+#          v3.1.5 by naka, drift@da9.no
 #
 # Some code within this file was written by authors other than myself. As such,
 # distributing this code or distributing modified versions of this code is
@@ -12,26 +14,19 @@
 # be freely distributable and modifiable for any use, public or private, though
 # I make no claim to ownership; original copyrights will be retained.. except as
 # I've just stated.
-#
-# Please mail bugs, etc. to me. Patches are welcome to fix bugs or clean up
-# the code, but please do not use a radically different coding style. Thanks
-# to everyone that's contributed!
-#
-# NOTE: This code should NOT be run as root. You deserve anything that happens
-#       to you if you run this code as a superuser. Also, note that giving a
-#       user admin access to the bot effectively gives them full access to the
-#       user under which your bot runs, as they can use the PEVAL command to
-#       execute any command, or possibly even change your password. I sincerely
-#       suggest that you exercise extreme caution when giving someone admin
-#       access to your bot, or that you disable the PEVAL command for non-owner
-#       accounts in your config file, irpg.conf
 
+# Check if we are running as root
+if ($> == 0) {
+    die "Running as root is not allowed for security reasons. Please run as a ".
+        "normal user.\n";
+}
 use strict;
 use warnings;
 use IO::Socket;
 use IO::Select;
 use Data::Dumper;
 use Getopt::Long;
+use File::Path qw(make_path);
 
 my @socket_backends;
 BEGIN {
@@ -104,6 +99,10 @@ GetOptions(\%opts,
     "newuserdest=s",
     "newuserfromname=s",
     "newuserfromaddr=s",
+    "tls_verify",
+    "tls_ca_file=s",
+    "tls_cert_file=s",
+    "tls_key_file=s",
     "gametitle=s",
 ) or debug("Error: Could not parse command line. Try $0 --help\n",1);
 
@@ -145,14 +144,139 @@ my %split; # holds nick!user@hosts for clients that have been netsplit
 my $freemessages = 4; # number of "free" privmsgs we can send. 0..$freemessages
 
 sub daemonize(); # prototype to avoid warnings
+sub parse_server_entry($);
+sub ensure_tls_material();
 sub create_socket(;%) {
     my %sockinfo = @_;
+
+    if (delete($sockinfo{UseTLS})) {
+        my $tls_hostname = delete($sockinfo{TLSServerName});
+        my $want_auto_cert = delete($sockinfo{AutoTLSCert});
+
+        debug("  [TLS] Initializing TLS connection...");
+
+        if (!eval { require IO::Socket::SSL; 1; }) {
+            debug("Error: TLS requested but IO::Socket::SSL is not available: $@\n");
+            return;
+        }
+        
+        debug("  [TLS] IO::Socket::SSL loaded successfully");
+
+        my %sslparams = (
+            SSL_startHandshake => 1,
+            SSL_verify_mode => 0x00,
+        );
+
+        if ($opts{tls_verify}) {
+            $sslparams{SSL_verify_mode} = 0x01;
+            if ($opts{tls_ca_file}) {
+                $sslparams{SSL_ca_file} = $opts{tls_ca_file};
+            }
+        }
+
+        if ($tls_hostname && $tls_hostname !~ /:/) {
+            $sslparams{SSL_hostname} = $tls_hostname;
+        }
+
+        if ($want_auto_cert) {
+            my ($cert_file, $key_file) = ensure_tls_material();
+            if ($cert_file && $key_file) {
+                $sslparams{SSL_cert_file} = $cert_file;
+                $sslparams{SSL_key_file} = $key_file;
+            }
+        }
+
+        my %combined = (%sockinfo, %sslparams);
+        debug("  [TLS] Calling IO::Socket::SSL->new() with: PeerAddr=$sockinfo{PeerAddr}, PeerPort=$sockinfo{PeerPort}");
+        
+        my $sock = eval { IO::Socket::SSL->new(%combined); };
+        if ($@) {
+            debug("  [TLS] Exception during socket creation: $@\n");
+            return;
+        }
+        
+        if (!$sock) {
+            my $err = IO::Socket::SSL::errstr();
+            debug("  [TLS] Connection failed: $err\n");
+            return;
+        }
+        
+        debug("  [TLS] Socket created successfully");
+        return $sock;
+    }
 
     for my $backend (@socket_backends) {
         my $sock = $backend->new(%sockinfo);
         return $sock if $sock;
     }
     return;
+}
+
+sub parse_server_entry($) {
+    my ($entry) = @_;
+    my ($host, $port, $tls) = ($entry, 6667, 0);
+    $entry =~ s/^\s+|\s+$//g;
+
+    # Bracketed IPv6: [2001:f:f:1]:+6697 or [2001:f:f:1]:6667
+    if ($entry =~ /^\[([^\]]+)\](?::(\+?)(\d+))?$/) {
+        $host = $1;
+        if (defined($3)) {
+            $port = $3;
+            $tls = ($2 eq "+") ? 1 : 0;
+        }
+        return ($host, $port, $tls);
+    }
+
+    # Raw IPv6, DNS, or IPv4 with optional trailing :port / :+port.
+    # We only peel off a port if it is at the very end.
+    if ($entry =~ /^(.*):(\+?)(\d+)$/) {
+        my ($candidate_host, $plus, $candidate_port) = ($1, $2, $3);
+        if (length($candidate_host)) {
+            $host = $candidate_host;
+            $port = $candidate_port;
+            $tls = ($plus eq "+") ? 1 : 0;
+        }
+    }
+    else {
+        $host = $entry;
+    }
+
+    return ($host, $port, $tls);
+}
+
+sub ensure_tls_material() {
+    my $cert_file = $opts{tls_cert_file} || "tls/client-cert.pem";
+    my $key_file = $opts{tls_key_file} || "tls/client-key.pem";
+
+    if (-f $cert_file && -f $key_file) {
+        return ($cert_file, $key_file);
+    }
+
+    if (!-d "tls") {
+        eval { make_path("tls"); 1; } or do {
+            debug("Error: could not create tls directory: $@\n");
+            return;
+        };
+    }
+
+    my $common_name = $opts{botnick} || "irpg-bot";
+    my @openssl_cmd = (
+        "openssl", "req", "-x509", "-newkey", "rsa:2048",
+        "-sha256", "-days", "3650", "-nodes",
+        "-keyout", $key_file,
+        "-out", $cert_file,
+        "-subj", "/CN=$common_name",
+    );
+
+    my $rc = system(@openssl_cmd);
+    if ($rc != 0 || !-f $cert_file || !-f $key_file) {
+        debug("Warning: could not auto-generate TLS cert/key with openssl; continuing without client cert.\n");
+        return;
+    }
+
+    chmod(0600, $key_file);
+    debug("Generated TLS client cert/key: $cert_file / $key_file");
+    return ($cert_file, $key_file);
 }
 
 if (! -e $opts{dbfile}) {
@@ -248,10 +372,17 @@ CONNECT: # cheese.
 loaddb();
 
 while (!$sock && $conn_tries < 2*@{$opts{servers}}) {
-    debug("Connecting to $opts{servers}->[0]...");
-    my %sockinfo = (PeerAddr => $opts{servers}->[0],
-                    PeerPort => 6667);
+    my ($peer_addr, $peer_port, $use_tls) = parse_server_entry($opts{servers}->[0]);
+    debug("Connecting to $opts{servers}->[0]".($use_tls ? " (TLS)" : "")."...");
+    debug("  -> Parsed: host=$peer_addr, port=$peer_port, tls=$use_tls");
+    my %sockinfo = (PeerAddr => $peer_addr,
+                    PeerPort => $peer_port);
     if ($opts{localaddr}) { $sockinfo{LocalAddr} = $opts{localaddr}; }
+    if ($use_tls) {
+        $sockinfo{UseTLS} = 1;
+        $sockinfo{TLSServerName} = $peer_addr;
+        $sockinfo{AutoTLSCert} = 1;
+    }
     $sock = create_socket(%sockinfo) or
         debug("Error: failed to connect: $!\n");
     ++$conn_tries;
@@ -259,7 +390,14 @@ while (!$sock && $conn_tries < 2*@{$opts{servers}}) {
         # cycle front server to back if connection failed
         push(@{$opts{servers}},shift(@{$opts{servers}}));
     }
-    else { debug("Connected."); }
+    else { 
+        debug("Connected."); 
+        if ($use_tls && ref($sock) =~ /SSL/) {
+            debug("  -> TLS socket established");
+        } elsif ($use_tls) {
+            debug("  -> Socket type: ".ref($sock));
+        }
+    }
 }
 
 if (!$sock) {
@@ -269,6 +407,7 @@ if (!$sock) {
 $conn_tries=0;
 
 $sel = IO::Select->new($sock);
+debug("[MAIN] IO::Select initialized with socket");
 
 sts("NICK $opts{botnick}");
 sts("USER $opts{botuser} 0 0 :$opts{botrlnm}");
@@ -278,8 +417,26 @@ while (1) {
     if (defined($readable)) {
         my $fh = $readable->[0];
         my $buffer2;
-        $fh->recv($buffer2,512,0);
-        if (length($buffer2)) {
+        # Use sysread for both plain and TLS sockets (recv() not supported by IO::Socket::SSL)
+        my $n = eval { $fh->sysread($buffer2,512); 1; };
+        if ($@) {
+            debug("[RECV] sysread() failed: $@");
+            $rps{$_}{online}=1 for keys(%auto_login);
+            writedb();
+            close($fh);
+            $sel->remove($fh);
+            if ($opts{reconnect}) {
+                undef(@queue);
+                undef($sock);
+                debug("Socket recv error; disconnected. Waiting $opts{reconnect_wait}s before next connection attempt...");
+                sleep($opts{reconnect_wait});
+                goto CONNECT;
+            }
+            else { debug("Socket recv error; disconnected.",1); }
+        }
+        elsif (length($buffer2)) {
+            debug("[RECV] got ".length($buffer2)." bytes");
+            $inbytes += length($buffer2);
             $buffer .= $buffer2;
             while (index($buffer,"\n") != -1) {
                 my $line = substr($buffer,0,index($buffer,"\n")+1);
@@ -310,7 +467,10 @@ while (1) {
             else { debug("Socket closed; disconnected.",1); }
         }
     }
-    else { select(undef,undef,undef,1); }
+    else { 
+        debug("[MAIN] select() timeout (no data available this cycle)");
+        select(undef,undef,undef,1); 
+    }
     if ((time()-$lasttime) >= $opts{self_clock}) { rpcheck(); }
 }
 
@@ -336,8 +496,17 @@ sub parse {
     }
     $arg[1] = lc($arg[1]); # original case no longer matters
     if ($arg[1] eq '433' && $opts{botnick} eq $arg[3]) {
+        # 433: Nickname is already in use
         $opts{botnick} .= 0;
         sts("NICK $opts{botnick}");
+    }
+    elsif ($arg[1] eq '437' && $opts{botnick} eq $arg[3]) {
+        # 437: Nick/channel is temporarily unavailable (held by services)
+        if ($opts{botaltnick}) {
+            debug("[PARSE] Raw 437: Nick temporarily unavailable, switching to botaltnick");
+            $opts{botnick} = $opts{botaltnick};
+            sts("NICK $opts{botnick}");
+        }
     }
     elsif ($arg[1] eq 'join') {
         # %onchan holds time user joined channel. used for the advertisement ban
@@ -1105,9 +1274,14 @@ sub sts { # send to server
     my($text,$skipq) = @_;
     if ($skipq) {
         if ($sock) {
-            print $sock "$text\r\n";
+            my $rc = eval { print $sock "$text\r\n"; 1; };
+            if ($@) {
+                debug("Error: send() failed: $@\n");
+                undef(@queue);
+                return;
+            }
             $outbytes += length($text) + 2;
-            debug("-> $text");
+            debug("[SEND] -> $text");
         }
         else {
             # something is wrong. the socket is closed. clear the queue
@@ -1141,9 +1315,14 @@ sub fq { # deliver message(s) from queue
             last();
         }
         if ($sock) {
-            debug("(fm$freemessages) -> $line");
+            debug("[QUEUE-SEND] (fm$freemessages) -> $line");
             --$freemessages if $freemessages > 0;
-            print $sock "$line\r\n";
+            my $rc = eval { print $sock "$line\r\n"; 1; };
+            if ($@) {
+                debug("Error: queue send failed: $@\n");
+                undef(@queue);
+                last();
+            }
             $sentbytes += length($line) + 2;
         }
         else {
