@@ -33,6 +33,13 @@ use IO::Select;
 use Data::Dumper;
 use Getopt::Long;
 
+my @socket_backends;
+BEGIN {
+    push(@socket_backends, "IO::Socket::IP") if eval { require IO::Socket::IP; 1; };
+    push(@socket_backends, "IO::Socket::INET6") if eval { require IO::Socket::INET6; 1; };
+    push(@socket_backends, "IO::Socket::INET");
+}
+
 my %opts;
 
 readconfig();
@@ -138,6 +145,15 @@ my %split; # holds nick!user@hosts for clients that have been netsplit
 my $freemessages = 4; # number of "free" privmsgs we can send. 0..$freemessages
 
 sub daemonize(); # prototype to avoid warnings
+sub create_socket(;%) {
+    my %sockinfo = @_;
+
+    for my $backend (@socket_backends) {
+        my $sock = $backend->new(%sockinfo);
+        return $sock if $sock;
+    }
+    return;
+}
 
 if (! -e $opts{dbfile}) {
     $|=1;
@@ -189,8 +205,8 @@ if (! -e $opts{dbfile}) {
 # this is almost silly...
 if ($opts{checkupdates}) {
     print "Checking for updates...\n\n";
-    my $tempsock = IO::Socket::INET->new(PeerAddr=>"jotun.ultrazone.org:80",
-                                         Timeout => 15);
+    my $tempsock = create_socket(PeerAddr=>"jotun.ultrazone.org:80",
+                                 Timeout => 15);
     if ($tempsock) {
         print $tempsock "GET /g7/version.php?version=$version HTTP/1.1\r\n".
                         "Host: jotun.ultrazone.org:80\r\n\r\n";
@@ -236,7 +252,7 @@ while (!$sock && $conn_tries < 2*@{$opts{servers}}) {
     my %sockinfo = (PeerAddr => $opts{servers}->[0],
                     PeerPort => 6667);
     if ($opts{localaddr}) { $sockinfo{LocalAddr} = $opts{localaddr}; }
-    $sock = IO::Socket::INET->new(%sockinfo) or
+    $sock = create_socket(%sockinfo) or
         debug("Error: failed to connect: $!\n");
     ++$conn_tries;
     if (!$sock) {
@@ -564,7 +580,7 @@ sub parse {
                                 "the game and as such may be stopped or even ".
                                 "without warning.",$usernick);
                         if ($opts{phonehome}) {
-                            my $tempsock = IO::Socket::INET->new(PeerAddr=>
+                            my $tempsock = create_socket(PeerAddr=>
                                 "jotun.ultrazone.org:80");
                             if ($tempsock) {
                                 print $tempsock
@@ -1029,6 +1045,37 @@ sub parse {
                         notice("Logon successful. Next level in ".
                                duration($rps{$arg[4]}{next}).".", $usernick);
                     }
+                }
+            }
+            elsif ($arg[3] eq "forcelogin") {
+                if (!ha($username)) {
+                    privmsg("You don't have access to FORCELOGIN.", $usernick);
+                }
+                elsif (!defined($arg[4])) {
+                    privmsg("Try: FORCELOGIN <char name>", $usernick, 1);
+                }
+                elsif (!exists($rps{$arg[4]})) {
+                    privmsg("No such account $arg[4].", $usernick, 1);
+                }
+                elsif ($rps{$arg[4]}{online}) {
+                    privmsg("$arg[4] is already online.", $usernick, 1);
+                }
+                elsif (!exists($onchan{$rps{$arg[4]}{nick}})) {
+                    privmsg("$arg[4]\'s nick ($rps{$arg[4]}{nick}) is not in ".
+                            "$opts{botchan}.", $usernick, 1);
+                }
+                else {
+                    my $fnick = $rps{$arg[4]}{nick};
+                    $rps{$arg[4]}{online} = 1;
+                    $rps{$arg[4]}{lastlogin} = time();
+                    if ($opts{voiceonlogin}) {
+                        sts("MODE $opts{botchan} +v :$fnick");
+                    }
+                    chanmsg("$arg[4], the level $rps{$arg[4]}{level} ".
+                            "$rps{$arg[4]}{class}, has been force-logged in ".
+                            "by $usernick from nick $fnick. Next level in ".
+                            duration($rps{$arg[4]}{next}).".");
+                    privmsg("$arg[4] force-logged in as $fnick.", $usernick, 1);
                 }
             }
         }

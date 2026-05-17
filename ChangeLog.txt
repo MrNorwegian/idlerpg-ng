@@ -3,8 +3,37 @@ http://idlerpg.net. Entries are written backwards. That is, items at the bottom
 of the file were added first, and each subsequent addition is placed on a line
 before it. Don't ask me why I do it that way: I do not know.
 
-Thanks for your interest in the Idle RPG! Feel free to contact me with ideas and
-comments, or post them in the forum on the website for public view.
+Thanks for your interest in the Idle RPG! Feel free to contribute on github.
+
+--------------------------------------------------------------------------------
+  v3.1.5:  released 5/17/2026
+--------------------------------------------------------------------------------
+  - added TLS support for IRC server connections using +port syntax in server
+    entries (example: server irc.example.net:+6697)
+  - added TLS command line/config options: tls_verify, tls_ca_file,
+    tls_cert_file, tls_key_file
+  - added automatic generation of client TLS certificate/key when TLS is used
+    and no cert/key files are present
+  - fixed TLS receive path by using sysread() instead of recv() so
+    IO::Socket::SSL connections can receive IRC traffic correctly
+  - improved server entry parsing so DNS, IPv4, bracketed IPv6, and raw IPv6
+    formats all work with optional :port and :+port suffixes
+  - added handling for raw 437 (nick temporarily unavailable) to switch to
+    botaltnick when configured
+  - improved startup safety by refusing to run as root
+
+--------------------------------------------------------------------------------
+  v3.1.4: released 4/27/2026
+--------------------------------------------------------------------------------
+  - added modern socket backend fallback (IO::Socket::IP,
+    IO::Socket::INET6, IO::Socket::INET)
+  - included IPv6 support and related connection updates
+  - added forcelogin command
+
+--------------------------------------------------------------------------------
+  v3.1.3: released 4/27/2026
+--------------------------------------------------------------------------------
+  
 
 --------------------------------------------------------------------------------
   v3.1.2: released 6/6/04
